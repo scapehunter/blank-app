@@ -1,96 +1,83 @@
+import re
 import streamlit as st
 import pandas as pd
-from pypdf import PdfReader
-import re
+import pdfplumber
+
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+from extractor import extract_ticket_data
 
 st.set_page_config(page_title="CHE Operational Dashboard", layout="wide")
-
 st.title("🎈 CHE Operational Dashboard")
-st.write("Upload 1 PDF ticket")
+st.write("Upload PDF ticket(s)")
 
 
-def extract_ticket_data(text):
-    # 1. Regex for PNR (Matches 'Airline Ref' or 'CRS Ref' followed by a 6-character code)
-    pnr_pattern = r"(?:Airline Ref|CRS Ref)\s*:\s*([A-Z0-9]{6})"
-    pnr_match = re.search(pnr_pattern, text, re.IGNORECASE)
-    pnr = pnr_match.group(1).upper() if pnr_match else "Not Found"
+def build_ocr_lookup(pdf, text):
+    """
+    Only used for the boarding-pass format when the name is missing from the text
+    layer entirely. OCRs every page and returns {page_index: full_ocr_text}.
+    """
+    if not OCR_AVAILABLE:
+        return None
+    if "Departing Flight" not in text:
+        return None
+    if re.search(r"(Mr|Ms|Mrs|Mstr)\s+[A-Za-z][A-Za-z\s]{2,39}?\s+Adult", text, re.IGNORECASE):
+        return None  # name already present in text layer, no OCR needed
 
-    # 2. Regex for Passengers (Matches titles with dots like Mr. or Ms. and captures the name)
-    passenger_pattern = r"(?:Mr\.|Ms\.|Mrs\.|Mstr\.)\s+([A-Z\s]{3,40})"
-
-    # Find all matches for passenger strings
-    raw_matches = re.findall(passenger_pattern, text, re.IGNORECASE)
-
-    passengers = []
-    for name in raw_matches:
-        # Clean up any residual structural characters left over from the ticket table layout
-        clean_name = re.sub(r'[\r\n\t",]', '', name).strip()
-
-        # Deduplicate and skip corporate titles if they accidentally match
-        if clean_name and clean_name != "SWADESHI TRAVELS" and clean_name not in [p['name'] for p in passengers]:
-            # Determine gender based on the prefix mapping in the original text chunk
-            prefix_match = re.search(r"(Mr\.|Ms\.|Mrs\.|Mstr\.)\s+" + re.escape(name), text, re.IGNORECASE)
-            title = prefix_match.group(1).lower() if prefix_match else ""
-
-            if "mr." in title:
-                gender = "Male (Adult)"
-            elif "mstr." in title:
-                gender = "Male (Child)"
-            elif "ms." in title or "mrs." in title:
-                gender = "Female"
-            else:
-                gender = "Unknown"
-
-            passengers.append({
-                "name": clean_name,
-                "gender": gender
-            })
-
-    return {
-        "pnr": pnr,
-        "passengers": passengers
-    }
+    lookup = {}
+    for i, page in enumerate(pdf.pages):
+        try:
+            image = page.to_image(resolution=200).original
+            lookup[i] = pytesseract.image_to_string(image)
+        except Exception:
+            continue
+    return lookup
 
 
-def extractDetailsfromPdfTicket(uploaded_ticket):
-    all_tickets = []
+def extract_from_pdf(uploaded_file):
     try:
-        reader = PdfReader(uploaded_ticket)
-        full_text = ""
-
-        # Combine text from all pages in the PDF
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
-
-        ticket = extract_ticket_data(full_text)
-        # Append the extracted data as a dictionary
-        for passengerTicket in ticket["passengers"]:
-            all_tickets.append({
-                "File Name": uploaded_ticket.name,
-                "PNR": ticket["pnr"],
-                "Name": passengerTicket["name"],
-                "Gender": passengerTicket["gender"],
-            })
+        with pdfplumber.open(uploaded_file) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            ocr_lookup = build_ocr_lookup(pdf, text)
     except Exception as e:
-        st.error(f"Error reading {uploaded_ticket.name}: {e}")
+        st.error(f"Error reading {uploaded_file.name}: {e}")
         return None
 
-    if not all_tickets:
+    rows = extract_ticket_data(text, ocr_name_lookup=ocr_lookup)
+    if not rows:
         return None
 
-    return pd.DataFrame(all_tickets)
+    for row in rows:
+        row["File Name"] = uploaded_file.name
+
+    return rows
 
 
-pdf_file = st.file_uploader("Upload Ticket", type=["pdf"])
+uploaded_files = st.file_uploader("Upload Ticket(s)", type=["pdf"], accept_multiple_files=True)
 
-if pdf_file:
-    with st.spinner("Extracting tabular matrices from PDFs..."):
-        df = extractDetailsfromPdfTicket(pdf_file)
+if uploaded_files:
+    all_rows = []
+    with st.spinner("Extracting passenger data from PDFs..."):
+        for f in uploaded_files:
+            rows = extract_from_pdf(f)
+            if rows:
+                all_rows.extend(rows)
+            else:
+                st.warning(f"Could not extract any passenger rows from {f.name}.")
 
-    if df is None:
-        st.error("Error: Could not extract valid structural tables from the PDF. Ensure text is selectable (not scanned images).")
+    if not all_rows:
+        st.error("Error: Could not extract valid data from the uploaded PDF(s). "
+                  "Ensure text is selectable (not a scanned image).")
     else:
-        st.success("Tabular contents extracted successfully!")
-        st.dataframe(df)
+        st.success(f"Extracted {len(all_rows)} passenger row(s) from {len(uploaded_files)} file(s).")
+        column_order = ["File Name", "PNR", "Name", "Gender", "Sector",
+                         "Flight Number", "Return Sector", "Return Flight Number"]
+        df = pd.DataFrame(all_rows)[column_order]
+        st.dataframe(df, use_container_width=True)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download as CSV", csv, "ticket_data.csv", "text/csv")
