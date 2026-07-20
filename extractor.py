@@ -1,174 +1,395 @@
+import io
 import re
+import unicodedata
+
+from pypdf import PdfReader
+
+# ============================================================================
+# Ticket extraction logic (verified against real uploaded PDFs — see notes
+# inline for the specific real-text quirks each fix addresses)
+# ============================================================================
+
+TITLE_GENDER = {
+    "MR": "Male", "MSTR": "Male", "MASTER": "Male",
+    "MS": "Female", "MRS": "Female", "MISS": "Female",
+}
+
+NOT_IDENTIFIED = "Not Identified"
 
 
-def _gender_from_title(title):
-    t = title.lower()
-    if t.startswith("mstr"):
-        return "Male (Child)"
-    if t.startswith("mr"):
-        return "Male (Adult)"
-    if t in ("ms", "mrs"):
-        return "Female"
-    return "Unknown"
+def _normalize(text):
+    """Real PDF text extraction (pypdf/pdfplumber) can contain non-breaking
+    spaces (\\xa0) and other unicode whitespace variants in place of plain
+    spaces — e.g. 'Airline\\xa0Ref' instead of 'Airline Ref'. Substring
+    checks and literal-space regexes silently fail to match these unless
+    the text is normalized first."""
+    text = text.replace("\xa0", " ")
+    text = unicodedata.normalize("NFKC", text)
+    return text
 
 
-# ---------- Format A: multi-passenger agency ticket (Akbar Travels style) ----------
-
-def _leg_direction(text, pos):
-    """Return 'ONWARD' or 'RETURN' depending on which label most recently precedes pos."""
-    onward_positions = [m.start() for m in re.finditer(r"\bONWARD\b", text)]
-    return_positions = [m.start() for m in re.finditer(r"\bRETURN\b", text)]
-    last_onward = max([p for p in onward_positions if p <= pos], default=-1)
-    last_return = max([p for p in return_positions if p <= pos], default=-1)
-    return "RETURN" if last_return > last_onward else "ONWARD"
+def _gender(title):
+    return TITLE_GENDER.get(title.upper().rstrip("."), None)
 
 
-def extract_agency_format(text):
-    # PNR
-    pnr_match = re.search(r"(?:CRS Ref|Airline Ref)\s*:\s*([A-Z0-9]{5,8})", text, re.IGNORECASE)
-    pnr = pnr_match.group(1).upper() if pnr_match else "Not Found"
+def _fill(value):
+    """Replace missing/empty values with an explicit marker instead of
+    silently dropping the field — every column must always have something
+    visible, never a blank or omitted entry."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return NOT_IDENTIFIED
+    return value
 
-    # City name -> 3-letter code map, built from anywhere in the doc (order-independent)
-    city_to_code = {}
-    for m in re.finditer(r"\b([A-Z][a-zA-Z]+)\s*\[([A-Z]{3})\]", text):
-        city_to_code[m.group(1)] = m.group(2)
 
-    # Each flight leg has a header line "<CityA> <CityB>" immediately followed by "Airline Ref :"
-    # (optionally preceded by ONWARD/RETURN on the same or previous token)
-    header_pattern = re.compile(
-        r"([A-Z][a-zA-Z]+)\s+([A-Z][a-zA-Z]+)\s*\n(?:Airline Ref)\s*:\s*([A-Z0-9]{5,8})"
+# ---------------------------------------------------------------------------
+# Format A: Agency multi-passenger table (Akbar Travels / Swadeshi Travels
+# style). Markers: "ONWARD"/"RETURN" section headers + "Airline Ref :" PNR.
+# ---------------------------------------------------------------------------
+def _is_format_a(text):
+    return "Airline Ref" in text and ("ONWARD" in text or "RETURN" in text)
+
+
+def _extract_format_a(text):
+    legs = []
+    leg_pattern = re.compile(
+        r"(ONWARD|RETURN)\s+(.*?)\n.*?Airline Ref\s*:\s*([A-Z0-9]{5,6})",
+        re.DOTALL,
     )
-    traveler_start = text.find("Traveler(s) Information")
-    search_end = traveler_start if traveler_start != -1 else len(text)
+    header_spans = [(m.start(), m.group(1), m.group(2).strip(), m.group(3))
+                     for m in leg_pattern.finditer(text)]
+    trav_idx = text.find("Traveler(s) Information")
+    bounds = [h[0] for h in header_spans] + [trav_idx if trav_idx != -1 else len(text)]
 
-    headers = list(header_pattern.finditer(text, 0, search_end))
+    for i, (start, direction, header_route, pnr) in enumerate(header_spans):
+        block = text[start:bounds[i + 1]]
+        # Flight number sits right after the "...Arrival date & time" table
+        # header and before the first "[XXX]" IATA code — its exact line
+        # breaks vary between legs in real extracted text, so anchor on
+        # word boundaries within that window instead of surrounding newlines.
+        header_idx = block.find("Arrival date & time")
+        bracket_idx = block.find("[", header_idx if header_idx != -1 else 0)
+        window = block[header_idx:bracket_idx] if header_idx != -1 and bracket_idx != -1 else block
+        fn_match = re.search(r"\b([A-Z0-9]{1,3}\s?\d{3,4})\b", window)
+        flight_number = fn_match.group(1).strip() if fn_match else None
+        codes = re.findall(r"([A-Za-z][A-Za-z\s]*?)\s*\[([A-Z]{3})\]", block)
+        origin = codes[0] if len(codes) > 0 else (None, None)
+        dest = codes[1] if len(codes) > 1 else (None, None)
+        legs.append({
+            "direction": direction, "pnr": pnr, "flight_number": flight_number,
+            "sector": f"{origin[1]}-{dest[1]}" if origin[1] and dest[1] else None,
+        })
 
-    onward_legs, return_legs = [], []
-    flight_pattern = re.compile(r"([A-Z0-9]{2,4}\s?\d{2,4})\s*\((?:AIRBUS|A\d{3})", re.IGNORECASE)
+    trav_block = text[trav_idx:] if trav_idx != -1 else text
+    name_pattern = re.compile(
+        r"\b(Mr\.|Ms\.|Mrs\.|Miss|Master)[ \t]+((?:(?!Nil\b)[A-Z][A-Za-z]*[ \t]*)+)"
+    )
+    seen = {}
+    for m in name_pattern.finditer(trav_block):
+        title, name = m.group(1), m.group(2).strip()
+        # Real PDF text sometimes glues the row's "Nil" values directly onto
+        # the name with no space (e.g. "LITTMANNNil") — strip that suffix.
+        name = re.sub(r"Nil$", "", name).strip()
+        key = name.upper()
+        if key not in seen:
+            seen[key] = {"name": name, "gender": _gender(title.rstrip("."))}
+    return {"booking_ref": legs[0]["pnr"] if legs else None,
+            "legs": legs, "passengers": list(seen.values())}
 
-    for i, hm in enumerate(headers):
-        origin_city, dest_city = hm.group(1), hm.group(2)
-        origin_code = city_to_code.get(origin_city, "???")
-        dest_code = city_to_code.get(dest_city, "???")
 
-        block_end = headers[i + 1].start() if i + 1 < len(headers) else search_end
-        block_text = text[hm.end():block_end]
-        fm = flight_pattern.search(block_text)
-        flight_no = re.sub(r"\s+", " ", fm.group(1)).strip() if fm else "Not Found"
+# ---------------------------------------------------------------------------
+# Format B: IndiGo single-passenger-per-page itinerary. Markers:
+# "Departing Flight" / "Return Flight" headers. NOTE: verified against a
+# real uploaded file that pypdf/pdfplumber both drop the "PNR/Booking Ref."
+# label AND the passenger name entirely from the text layer (a rendering
+# artifact in the source PDF, not an extraction bug) — the PNR is recovered
+# via a fallback pattern, but the name genuinely cannot be recovered from
+# text extraction and is reported as "Not Identified" rather than guessed.
+# ---------------------------------------------------------------------------
+def _is_format_b(text):
+    return "Departing Flight" in text
 
-        leg = (flight_no, origin_code, dest_code)
-        if _leg_direction(text, hm.start()) == "RETURN":
-            return_legs.append(leg)
-        else:
-            onward_legs.append(leg)
 
-    def chain_sector(legs):
-        if not legs:
-            return "N/A"
-        codes = [origin for _, origin, dest in legs]
-        codes.append(legs[-1][2])
-        return "-".join(codes)
+def _extract_format_b(text):
+    pnr = None
+    pnr_match = re.search(r"PNR/Booking Ref\.?\s*\n?\s*([A-Z0-9]{5,6})", text)
+    if pnr_match:
+        pnr = pnr_match.group(1)
+    else:
+        fallback_match = re.search(r"\b([A-Z0-9]{5,7})Confirmed", text)
+        if fallback_match:
+            pnr = fallback_match.group(1)
 
-    def chain_flights(legs):
-        return ", ".join(fn for fn, _, _ in legs) if legs else "N/A"
+    sectors = re.findall(r"([A-Z]{3}-[A-Z]{3})", text)
 
-    onward_sector, onward_flight_no = chain_sector(onward_legs), chain_flights(onward_legs)
-    return_sector = chain_sector(return_legs) if return_legs else "N/A"
-    return_flight_no = chain_flights(return_legs) if return_legs else "N/A"
+    leg_pattern = re.compile(
+        r"(Departing Flight|Return Flight)\s+([A-Z0-9]{1,3}\s?\d{3,5})\s*\(([A-Z0-9]+)\)"
+        r"\s*([\d]{1,2}\s\w+\s\d{4})"
+    )
+    legs = []
+    for i, m in enumerate(leg_pattern.finditer(text)):
+        direction, flight_number, aircraft, date = m.groups()
+        sector = sectors[i] if i < len(sectors) else None
+        legs.append({
+            "direction": "ONWARD" if "Departing" in direction else "RETURN",
+            "pnr": pnr, "flight_number": flight_number.strip(), "sector": sector,
+        })
 
-    # Passengers: title + ALL-CAPS multi-word name (word tokens of 2+ letters, to avoid
-    # swallowing the trailing "Nil Nil Nil Nil" columns that follow each row)
+    name_match = re.search(
+        r"\b((?i:Mr|Ms|Mrs|Miss|Master))\.?\s+([A-Z][A-Za-z]*"
+        r"(?:\s+(?!Adult\b|Sector\b|Seat\b|Male\b|Female\b)[A-Z][A-Za-z]*)*)",
+        text,
+    )
     passengers = []
-    passenger_pattern = re.compile(r"(Mr|Ms|Mrs|Mstr)\.\s+((?:[A-Z]{2,}\s*)+)")
-    seen = set()
-    for m in passenger_pattern.finditer(text):
-        title, raw_name = m.group(1), m.group(2)
-        name = re.sub(r"\s+", " ", raw_name).strip()
-        if name == "SWADESHI TRAVELS" or name in seen or not name:
-            continue
-        seen.add(name)
-        passengers.append({
-            "PNR": pnr, "Name": name, "Gender": _gender_from_title(title),
-            "Sector": onward_sector, "Flight Number": onward_flight_no,
-            "Return Sector": return_sector, "Return Flight Number": return_flight_no,
+    if name_match:
+        title, name = name_match.groups()
+        passengers.append({"name": name.strip(), "gender": _gender(title)})
+
+    return {"booking_ref": pnr, "legs": legs, "passengers": passengers}
+
+
+# ---------------------------------------------------------------------------
+# Format C: Consolidator/agency e-ticket with a different Airline PNR per
+# leg (e.g. TripJack-style Akasa booking). Markers: "Booking ID:" + "Airline
+# PNR" label.
+# ---------------------------------------------------------------------------
+def _is_format_c(text):
+    return "Airline PNR" in text and "Booking ID" in text
+
+
+def _extract_format_c(text):
+    booking_ref_match = re.search(r"Booking ID:\s*(\S+)", text)
+    booking_ref = booking_ref_match.group(1) if booking_ref_match else None
+
+    leg_pnrs = re.findall(r"([A-Z0-9]{5,6})\s*\nAirline PNR", text)
+
+    blocks = re.split(r"(?=Flight Detail)", text)
+    flight_blocks = [b for b in blocks if b.startswith("Flight Detail")]
+
+    legs = []
+    for i, block in enumerate(flight_blocks):
+        fn_match = re.search(r"\b([A-Z]{1,2}\s*-\s*\d{3,5})\b", block)
+        flight_number = fn_match.group(1).replace(" ", "") if fn_match else None
+        sector_match = re.search(r"\b([A-Z]{3})-([A-Z]{3})\b", block)
+        origin, dest = (sector_match.groups() if sector_match else (None, None))
+        pnr = leg_pnrs[i] if i < len(leg_pnrs) else None
+        legs.append({
+            "direction": "ONWARD" if i == 0 else "RETURN",
+            "pnr": pnr, "flight_number": flight_number,
+            "sector": f"{origin}-{dest}" if origin and dest else None,
         })
-    return passengers
 
-
-# ---------- Format B: single-passenger-per-page IndiGo boarding pass ----------
-
-def extract_boarding_pass_format(text, ocr_name_lookup=None):
-    """
-    ocr_name_lookup: optional dict {page_index: "Mr Jaitra Talreja"} supplied by the caller
-    when the passenger name cannot be found in the normal text layer (see note below).
-    """
-    results = []
-    pnr_match = re.search(r"\b([A-Z0-9]{6})\s+Confirmed\b", text)
-    pnr = pnr_match.group(1).upper() if pnr_match else "Not Found"
-
-    sector_pattern = re.compile(r"Sector\s+Seat\s+6E Add-ons\s*\n?\s*([A-Z]{3})\s*-\s*([A-Z]{3})")
-    flight_pattern = re.compile(
-        r"(?:Departing|Returning)\s+Flight\s*[•*]?\s*([A-Z0-9]{2,4}\s?\d{2,5})\s*\(", re.IGNORECASE
+    name_pattern = re.compile(
+        r"\b(MS|MR|MRS|MISS|MSTR)\s+([A-Z][A-Z\s]+?)\s*\(\s*[A-Z]\s*\)"
     )
-    name_pattern = re.compile(r"(Mr|Ms|Mrs|Mstr)\s+([A-Za-z][A-Za-z\s]{2,39}?)\s+Adult", re.IGNORECASE)
+    seen = {}
+    for m in name_pattern.finditer(text):
+        title, name = m.group(1), m.group(2).strip()
+        key = name.upper()
+        if key not in seen:
+            seen[key] = {"name": name, "gender": _gender(title)}
 
-    # Split into per-passenger pages using a page-number footer as the anchor,
-    # since the name itself is sometimes missing from the text layer (see note).
-    page_pattern = re.compile(r"(\d+) of (\d+)")
-    page_bounds = [m.start() for m in page_pattern.finditer(text)]
-    page_bounds.append(len(text))
+    return {"booking_ref": booking_ref, "legs": legs, "passengers": list(seen.values())}
 
-    start = 0
-    for idx, end in enumerate(page_bounds):
-        chunk = text[start:end]
-        start = end
 
-        name_match = name_pattern.search(chunk)
-        if name_match:
-            title, raw_name = name_match.group(1), name_match.group(2)
-            name = re.sub(r"\s+", " ", raw_name).strip()
-        elif ocr_name_lookup and idx in ocr_name_lookup:
-            # ocr_name_lookup[idx] is the full OCR'd text of that page. The layout is always
-            # "<Title> <Name words...> <age qualifier: Adult/Child/Infant>\n\nSector ...", so we
-            # take everything between the title and the "Sector" keyword (OCR reads plain English
-            # words like "Sector" reliably even when it mangles the age qualifier) and drop the
-            # last token, which is always that age qualifier - robust to OCR noise on that one
-            # word without depending on it being capitalized correctly.
-            ocr_page_text = ocr_name_lookup[idx]
-            om = re.search(r"(Mr|Ms|Mrs|Mstr)\s+(.*?)\n\s*\n?\s*Sector", ocr_page_text, re.DOTALL)
-            if om:
-                title = om.group(1)
-                words = om.group(2).split()
-                name = " ".join(words[:-1]) if len(words) > 1 else " ".join(words)
-            else:
-                title, name = "Unknown", "Not Found"
-        else:
-            title, name = "Unknown", "Not Found (name missing from PDF text layer)"
+# ---------------------------------------------------------------------------
+# Format D: goindigo.in web itinerary (distinct from the IndiGo per-passenger
+# PDF in Format B — this one comes from the goindigo.in "Itinerary" web page,
+# uses "PNR/Booking Reference" with no period, states gender inline as
+# "Adult | Male |", gives sectors directly (e.g. "IXE-BOM"), and can have
+# multiple legs that are NOT a round trip (e.g. IXE-BOM-DEL is a connecting
+# multi-city itinerary, not "onward/return") — so legs are labeled
+# sequentially ("LEG 1", "LEG 2") rather than guessed as onward/return.
+# ---------------------------------------------------------------------------
+def _is_format_d(text):
+    return "PNR/Booking Reference" in text
 
-        if "Passenger Information" not in chunk and "Departing Flight" not in chunk:
-            continue  # trailing/empty tail chunk after the last real page
 
-        sector_matches = sector_pattern.findall(chunk)
-        onward_sector = f"{sector_matches[0][0]}-{sector_matches[0][1]}" if sector_matches else "Not Found"
-        return_sector = f"{sector_matches[1][0]}-{sector_matches[1][1]}" if len(sector_matches) > 1 else "N/A"
+def _extract_format_d(text):
+    pnr_match = re.search(r"PNR/Booking Reference\s*([A-Z0-9]{5,7})", text)
+    pnr = pnr_match.group(1) if pnr_match else None
 
-        flight_matches = flight_pattern.findall(chunk)
-        onward_flight_no = re.sub(r"\s+", " ", flight_matches[0]).strip() if flight_matches else "Not Found"
-        return_flight_no = re.sub(r"\s+", " ", flight_matches[1]).strip() if len(flight_matches) > 1 else "N/A"
+    name_match = re.search(
+        r"(Mr|Ms|Mrs|Miss|Master)\.?\s+([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)*)\s*Adult",
+        text,
+    )
+    passengers = []
+    gender = None
+    gender_match = re.search(r"Adult\s*\|\s*(Male|Female)\s*\|", text)
+    if gender_match:
+        gender = gender_match.group(1)
+    if name_match:
+        title, name = name_match.groups()
+        passengers.append({"name": name.strip(), "gender": gender or _gender(title)})
 
-        if not chunk.strip():
-            continue
-        results.append({
-            "PNR": pnr, "Name": name, "Gender": _gender_from_title(title),
-            "Sector": onward_sector, "Flight Number": onward_flight_no,
-            "Return Sector": return_sector, "Return Flight Number": return_flight_no,
+    sectors = re.findall(r"\b([A-Z]{3})\s*-\s*([A-Z]{3})\b", text)
+    flight_pattern = re.compile(
+        r"([A-Z0-9]{1,3}\s?\d{3,5})\s*\(([A-Z0-9]+)\)\s*(\d{1,2}\s\S+\s\d{4})Check-in"
+    )
+    flights = flight_pattern.findall(text)
+
+    legs = []
+    n = max(len(sectors), len(flights))
+    for i in range(n):
+        origin, dest = sectors[i] if i < len(sectors) else (None, None)
+        flight_number = flights[i][0].strip() if i < len(flights) else None
+        legs.append({
+            "direction": f"LEG {i + 1}", "pnr": pnr,
+            "flight_number": flight_number,
+            "sector": f"{origin}-{dest}" if origin and dest else None,
         })
-    return results
+
+    return {"booking_ref": pnr, "legs": legs, "passengers": passengers}
 
 
-def extract_ticket_data(text, ocr_name_lookup=None):
-    if "Traveler(s) Information" in text:
-        return extract_agency_format(text)
-    if "Departing Flight" in text or "PNR/Booking Ref" in text:
-        return extract_boarding_pass_format(text, ocr_name_lookup=ocr_name_lookup)
-    return []
+# ---------------------------------------------------------------------------
+# Format E: Air India Express itinerary. Markers: "Air India Express" +
+# "PNR :" label. Verified against one real sample — single leg, direction
+# given explicitly as "Onward"/"Return" in the text.
+# ---------------------------------------------------------------------------
+def _is_format_e(text):
+    return "Air India Express" in text
+
+
+def _extract_format_e(text):
+    pnr_match = re.search(r"PNR\s*:\s*([A-Z0-9]{5,7})", text)
+    pnr = pnr_match.group(1) if pnr_match else None
+
+    name_match = re.search(
+        r"Name\s*Seat\s*Add\s*Ons\s*\n?\s*(Mr|Ms|Mrs|Miss|Master)\.?[ \t]+([A-Za-z]+(?:[ \t]+[A-Za-z]+)*)",
+        text,
+    )
+    passengers = []
+    if name_match:
+        title, name = name_match.groups()
+        passengers.append({"name": name.strip(), "gender": _gender(title)})
+
+    sector_match = re.search(r"\b([A-Z]{3})\s*-\s*([A-Z]{3})\b", text)
+    origin, dest = (sector_match.groups() if sector_match else (None, None))
+
+    flight_match = re.search(
+        r"\b([A-Z]{1,2}\s?\d{3,5})(?=(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),)", text
+    )
+    flight_number = flight_match.group(1).strip() if flight_match else None
+
+    direction_match = re.search(r"\b(Onward|Return)\b", text)
+    direction = direction_match.group(1).upper() if direction_match else None
+
+    legs = [{
+        "direction": direction, "pnr": pnr, "flight_number": flight_number,
+        "sector": f"{origin}-{dest}" if origin and dest else None,
+    }]
+
+    return {"booking_ref": pnr, "legs": legs, "passengers": passengers}
+
+
+FORMATS = [
+    ("Agency multi-passenger (ONWARD/RETURN)", _is_format_a, _extract_format_a),
+    ("IndiGo per-passenger itinerary", _is_format_b, _extract_format_b),
+    ("Agency e-ticket, per-leg PNR", _is_format_c, _extract_format_c),
+    ("goindigo.in web itinerary", _is_format_d, _extract_format_d),
+    ("Air India Express itinerary", _is_format_e, _extract_format_e),
+]
+
+
+def extract_ticket(text):
+    text = _normalize(text)
+    for name, detector, extractor in FORMATS:
+        if detector(text):
+            result = extractor(text)
+            result["_format"] = name
+            return result
+    return {"_format": "Unrecognized format", "booking_ref": None, "legs": [], "passengers": []}
+
+
+def _has_missing_fields(result):
+    """True if any field a real ticket page should have is still missing
+    after text-layer extraction — this is what triggers the OCR fallback,
+    rather than running OCR on every page unconditionally."""
+    if not result.get("passengers"):
+        return True
+    if not result.get("booking_ref"):
+        return True
+    legs = result.get("legs", [])
+    if not legs:
+        return True
+    for leg in legs:
+        if not leg.get("pnr") or not leg.get("sector") or not leg.get("flight_number"):
+            return True
+    return False
+
+
+def _merge_ocr_result(text_result, ocr_result):
+    """Fill in ONLY the fields text-layer extraction missed, using what OCR
+    found. Never overwrites a field that was already successfully
+    extracted from the text layer."""
+    merged = dict(text_result)
+    merged["legs"] = [dict(l) for l in text_result.get("legs", [])]
+
+    if not merged.get("booking_ref") and ocr_result.get("booking_ref"):
+        merged["booking_ref"] = ocr_result["booking_ref"]
+
+    if not merged.get("passengers") and ocr_result.get("passengers"):
+        merged["passengers"] = ocr_result["passengers"]
+
+    ocr_legs = ocr_result.get("legs", [])
+    if not merged["legs"] and ocr_legs:
+        merged["legs"] = ocr_legs
+    else:
+        for i, leg in enumerate(merged["legs"]):
+            ocr_leg = next((ol for ol in ocr_legs if ol.get("direction") == leg.get("direction")), None)
+            if ocr_leg is None and i < len(ocr_legs):
+                ocr_leg = ocr_legs[i]
+            if ocr_leg:
+                for field in ("pnr", "sector", "flight_number"):
+                    if not leg.get(field) and ocr_leg.get(field):
+                        leg[field] = ocr_leg[field]
+
+    if merged.get("_format") == "Unrecognized format" and ocr_result.get("_format") != "Unrecognized format":
+        merged["_format"] = ocr_result.get("_format")
+
+    return merged
+
+
+def ocr_page_text(pdf_bytes, page_num):
+    """Render one page to an image and OCR it. Used only as a fallback when
+    the text layer is missing something — verified against a real ticket
+    where the passenger name is present visually but dropped from the text
+    layer by a PDF-rendering artifact."""
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+        images = convert_from_bytes(pdf_bytes, first_page=page_num, last_page=page_num, dpi=200)
+        if not images:
+            return ""
+        return pytesseract.image_to_string(images[0])
+    except Exception:
+        return ""
+
+
+def to_rows(result, source_file, page_num):
+    """One row per (passenger, leg). Every field is guaranteed to be
+    present: missing values are marked 'Not Identified' rather than
+    silently dropped, so a failed extraction is always visible."""
+    rows = []
+    legs = result.get("legs", [])
+    passengers = result.get("passengers", [])
+    if not passengers:
+        passengers = [{"name": None, "gender": None}]
+    if not legs:
+        legs = [{"direction": None, "pnr": result.get("booking_ref"), "flight_number": None, "sector": None}]
+
+    for pax in passengers:
+        for leg in legs:
+            rows.append({
+                "Source File": source_file,
+                "Page": page_num,
+                "Format Detected": result.get("_format"),
+                "Name": _fill(pax.get("name")),
+                "Gender": _fill(pax.get("gender")),
+                "PNR": _fill(leg.get("pnr")),
+                "Direction": _fill(leg.get("direction")),
+                "Sector": _fill(leg.get("sector")),
+                "Flight Number": _fill(leg.get("flight_number")),
+                "Booking Ref": _fill(result.get("booking_ref")),
+            })
+    return rows
